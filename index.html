@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=yes">
+  <title>LocalEats&Stay | Hotels & Restaurants Discovery</title>
+  <!-- Tailwind + Font Awesome + Google Fonts -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300;400;500;600;700&display=swap" rel="stylesheet">
+  <!-- Firebase SDKs -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
+    import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js";
+    import { getFirestore, collection, doc, getDoc, getDocs, setDoc, updateDoc, addDoc, deleteDoc, query, where, orderBy, limit, increment, arrayUnion, arrayRemove } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
+    
+    // ======================= FIREBASE CONFIGURATION =======================
+    // 🔴 REPLACE WITH YOUR FIREBASE PROJECT CREDENTIALS 🔴
+    const firebaseConfig = {
+      apiKey: "YOUR_API_KEY",
+      authDomain: "YOUR_AUTH_DOMAIN",
+      projectId: "YOUR_PROJECT_ID",
+      storageBucket: "YOUR_STORAGE_BUCKET",
+      messagingSenderId: "YOUR_SENDER_ID",
+      appId: "YOUR_APP_ID"
+    };
+    
+    // Initialize Firebase
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const db = getFirestore(app);
+    
+    // Google Maps API Key (required for Places API & details)
+    const GOOGLE_MAPS_API_KEY = "YOUR_GOOGLE_MAPS_API_KEY";
+    
+    // Expose globals for non-module scripts
+    window.db = db;
+    window.auth = auth;
+    window.GOOGLE_MAPS_API_KEY = GOOGLE_MAPS_API_KEY;
+    window.signOut = signOut;
+    window.getFirestore = () => db;
+    window.getAuth = () => auth;
+    
+    // Import additional functions for inline usage
+    window.collection = collection;
+    window.doc = doc;
+    window.getDoc = getDoc;
+    window.getDocs = getDocs;
+    window.setDoc = setDoc;
+    window.updateDoc = updateDoc;
+    window.addDoc = addDoc;
+    window.deleteDoc = deleteDoc;
+    window.query = query;
+    window.where = where;
+    window.orderBy = orderBy;
+    window.limit = limit;
+    window.increment = increment;
+    window.arrayUnion = arrayUnion;
+    window.arrayRemove = arrayRemove;
+  </script>
+  <!-- Google Maps API for Places (loaded after config) -->
+  <script src="https://maps.googleapis.com/maps/api/js?key=YOUR_GOOGLE_MAPS_API_KEY&libraries=places&callback=initMapsReady" async defer></script>
+  <style>
+    * { font-family: 'Inter', sans-serif; }
+    body { background: #f8fafc; }
+    .card-hover { transition: transform 0.2s ease, box-shadow 0.2s ease; }
+    .card-hover:hover { transform: translateY(-4px); box-shadow: 0 20px 25px -12px rgba(0,0,0,0.1); }
+    .rating-star { color: #facc15; }
+    .active-filter { background-color: #1e293b !important; color: white !important; border-color: #1e293b !important; }
+    .scrollbar-hide::-webkit-scrollbar { display: none; }
+    .toast-notify { position: fixed; bottom: 20px; right: 20px; z-index: 1000; background: #1e293b; color: white; padding: 12px 20px; border-radius: 30px; font-size: 14px; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); }
+  </style>
+</head>
+<body class="antialiased">
+  <div id="app" class="max-w-7xl mx-auto px-4 sm:px-6 py-5 pb-20">
+    <!-- dynamic header with auth status -->
+    <div id="headerArea" class="flex flex-wrap justify-between items-center mb-6 gap-3"></div>
+    <div id="mainContent"></div>
+  </div>
+  
+  <script type="module">
+    // ----------------------------------------------
+    // GLOBAL STATE & REFERENCES
+    // ----------------------------------------------
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
+    import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js";
+    import { getFirestore, collection, doc, getDoc, getDocs, setDoc, updateDoc, addDoc, deleteDoc, query, where, orderBy, limit, increment, arrayUnion, arrayRemove, Timestamp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
+    
+    const app = initializeApp(window.firebaseConfig);
+    const auth = getAuth(app);
+    const db = getFirestore(app);
+    
+    let currentUser = null;
+    let currentUserRole = "user"; // 'admin' or 'user'
+    let adminMode = false;        // UI admin panel flag
+    let currentView = "listings"; // listings, detail, adminPanel
+    let selectedListingId = null;
+    let listingsCache = [];
+    
+    // Filters
+    let searchTerm = "";
+    let activeCategory = "all";
+    
+    // Helper functions
+    function showToast(msg, isError = false) {
+      const toast = document.createElement("div");
+      toast.className = "toast-notify";
+      toast.innerHTML = `<i class="fas ${isError ? 'fa-exclamation-triangle' : 'fa-check-circle'} mr-2"></i>${msg}`;
+      document.body.appendChild(toast);
+      setTimeout(() => toast.remove(), 3000);
+    }
+    
+    // Check admin role from Firestore users collection
+    async function fetchUserRole(user) {
+      if (!user) return "user";
+      const userRef = doc(db, "users", user.uid);
+      const snap = await getDoc(userRef);
+      if (snap.exists() && snap.data().role === "admin") return "admin";
+      // optionally set default role on first signup
+      if (!snap.exists()) {
+        await setDoc(userRef, { email: user.email, role: "user", name: user.displayName || user.email.split('@')[0], createdAt: Timestamp.now() });
+      }
+      return "user";
+    }
+    
+    // update header based on auth
+    async function updateHeader() {
+      const headerDiv = document.getElementById("headerArea");
+      if (!currentUser) {
+        headerDiv.innerHTML = `
+          <div class="flex items-center gap-3"><i class="fas fa-hotel text-2xl text-indigo-600"></i><h1 class="text-2xl font-bold text-slate-800">Local<span class="text-indigo-600">Eats&Stay</span></h1></div>
+          <button id="showAuthBtn" class="bg-indigo-600 hover:bg-indigo-700 text-white px-5 py-2 rounded-full text-sm font-medium shadow-md transition flex items-center gap-2"><i class="fas fa-sign-in-alt"></i> Sign in / Sign up</button>
+        `;
+        document.getElementById("showAuthBtn")?.addEventListener("click", () => renderAuthModal());
+        return;
+      }
+      const adminBadge = currentUserRole === "admin" ? `<span class="bg-red-100 text-red-700 text-xs px-2 py-1 rounded-full ml-2">Admin</span>` : "";
+      headerDiv.innerHTML = `
+        <div class="flex items-center gap-3"><i class="fas fa-hotel text-2xl text-indigo-600"></i><h1 class="text-2xl font-bold text-slate-800">Local<span class="text-indigo-600">Eats&Stay</span>${adminBadge}</h1></div>
+        <div class="flex gap-2 items-center">
+          <span class="text-sm text-gray-600 hidden sm:inline"><i class="fas fa-user-circle"></i> ${currentUser.email}</span>
+          ${currentUserRole === "admin" ? `<button id="adminDashboardBtn" class="bg-slate-800 hover:bg-slate-900 text-white px-4 py-2 rounded-full text-sm"><i class="fas fa-cog"></i> Admin</button>` : ""}
+          <button id="logoutBtn" class="bg-gray-200 hover:bg-gray-300 text-gray-800 px-4 py-2 rounded-full text-sm"><i class="fas fa-sign-out-alt"></i> Logout</button>
+        </div>
+      `;
+      document.getElementById("logoutBtn")?.addEventListener("click", async () => { await signOut(auth); currentUser = null; currentUserRole = "user"; adminMode = false; currentView = "listings"; renderMain(); });
+      document.getElementById("adminDashboardBtn")?.addEventListener("click", () => { if(currentUserRole === "admin") { adminMode = true; currentView = "adminPanel"; renderMain(); } });
+    }
+    
+    // ---------- Analytics: track visitor & listing views ----------
+    async function trackGlobalVisitor() {
+      const today = new Date().toISOString().slice(0,10);
+      const statsRef = doc(db, "analytics", "globalStats");
+      const statsSnap = await getDoc(statsRef);
+      if (!statsSnap.exists()) {
+        await setDoc(statsRef, { totalVisitors: 1, dailyVisitors: { [today]: 1 }, lastDate: today });
+      } else {
+        const data = statsSnap.data();
+        const daily = data.dailyVisitors || {};
+        const updates = { totalVisitors: increment(1) };
+        if (daily[today]) updates.dailyVisitors = { ...daily, [today]: daily[today] + 1 };
+        else updates.dailyVisitors = { ...daily, [today]: 1 };
+        await updateDoc(statsRef, updates);
+      }
+    }
+    
+    async function trackListingView(listingId) {
+      if (!listingId) return;
+      const today = new Date().toISOString().slice(0,10);
+      const listingRef = doc(db, "listings", listingId);
+      const listingSnap = await getDoc(listingRef);
+      if (listingSnap.exists()) {
+        const data = listingSnap.data();
+        const dailyViews = data.dailyViews || {};
+        const updates = { totalViews: increment(1) };
+        if (dailyViews[today]) updates.dailyViews = { ...dailyViews, [today]: dailyViews[today] + 1 };
+        else updates.dailyViews = { ...dailyViews, [today]: 1 };
+        await updateDoc(listingRef, updates);
+      }
+    }
+    
+    // get Google Maps place details (rating, price_level, opening_hours, offers)
+    async function fetchGooglePlaceDetails(placeId) {
+      if (!placeId || !window.google) return null;
+      return new Promise((resolve) => {
+        const service = new window.google.maps.places.PlacesService(document.createElement('div'));
+        service.getDetails({ placeId: placeId, fields: ['rating', 'user_ratings_total', 'price_level', 'opening_hours', 'website', 'formatted_phone_number', 'editorial_summary'] }, (place, status) => {
+          if (status === 'OK' && place) resolve(place);
+          else resolve(null);
+        });
+      });
+    }
+    
+    // render listings with ranking (most reviews + internal rating)
+    function computeRankingScore(listing) {
+      const reviewCount = listing.reviewCount || 0;
+      const avgRating = listing.avgInternalRating || 0;
+      return (reviewCount * 0.6) + (avgRating * 10); // weighted ranking
+    }
+    
+    async function fetchListings() {
+      const q = query(collection(db, "listings"), orderBy("createdAt", "desc"));
+      const snap = await getDocs(q);
+      let listings = [];
+      snap.forEach(doc => listings.push({ id: doc.id, ...doc.data() }));
+      // apply search + category filter
+      let filtered = listings;
+      if (searchTerm.trim()) {
+        const term = searchTerm.toLowerCase();
+        filtered = filtered.filter(l => l.name.toLowerCase().includes(term) || (l.city && l.city.toLowerCase().includes(term)));
+      }
+      if (activeCategory !== "all") filtered = filtered.filter(l => l.category === activeCategory);
+      // sort by ranking score descending
+      filtered.sort((a,b) => computeRankingScore(b) - computeRankingScore(a));
+      return filtered;
+    }
+    
+    // render listing cards
+    async function renderListingsView() {
+      const listings = await fetchListings();
+      const filterHtml = `
+        <div class="flex flex-wrap gap-2 mb-6">
+          <button data-cat="all" class="cat-filter px-5 py-2 rounded-full text-sm font-medium border ${activeCategory === 'all' ? 'active-filter bg-slate-800 text-white' : 'bg-white border-gray-300'}">All</button>
+          <button data-cat="Hotel" class="cat-filter px-5 py-2 rounded-full text-sm font-medium border ${activeCategory === 'Hotel' ? 'active-filter bg-slate-800 text-white' : 'bg-white border-gray-300'}"><i class="fas fa-building"></i> Hotels</button>
+          <button data-cat="Restaurant" class="cat-filter px-5 py-2 rounded-full text-sm font-medium border ${activeCategory === 'Restaurant' ? 'active-filter bg-slate-800 text-white' : 'bg-white border-gray-300'}"><i class="fas fa-utensils"></i> Restaurants</button>
+          <button data-cat="Hostel" class="cat-filter px-5 py-2 rounded-full text-sm font-medium border ${activeCategory === 'Hostel' ? 'active-filter bg-slate-800 text-white' : 'bg-white border-gray-300'}"><i class="fas fa-bed"></i> Hostels</button>
+        </div>
+        <div class="relative mb-6">
+          <i class="fas fa-search absolute left-4 top-1/2 -translate-y-1/2 text-gray-400"></i>
+          <input type="text" id="searchInput" placeholder="Search by name or city..." class="w-full pl-12 pr-4 py-3 rounded-2xl border shadow-sm focus:ring-indigo-300" value="${searchTerm.replace(/"/g, '&quot;')}">
+        </div>
+      `;
+      
+      // Featured section (admin curated)
+      const featuredListings = listings.filter(l => l.featured === true).slice(0,4);
+      let featuredHtml = "";
+      if (featuredListings.length) {
+        featuredHtml = `<div class="mb-8"><h2 class="text-xl font-bold mb-3 flex items-center"><i class="fas fa-crown text-yellow-500 mr-2"></i> Featured Selections</h2><div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">${featuredListings.map(l => `
+          <div data-id="${l.id}" class="featured-card bg-white rounded-xl shadow p-3 cursor-pointer hover:shadow-md transition"><img src="${l.images?.[0] || 'https://picsum.photos/id/104/200/150'}" class="h-32 w-full object-cover rounded-lg"><h3 class="font-bold mt-2">${escapeHtml(l.name)}</h3><p class="text-xs text-gray-500">${l.city || ''}</p></div>
+        `).join('')}</div></div>`;
+      }
+      
+      let cardsHtml = "";
+      if (listings.length === 0) cardsHtml = `<div class="text-center py-12 bg-white rounded-2xl">No listings found.</div>`;
+      else {
+        cardsHtml = `<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">` + listings.map(l => {
+          const stars = renderStars(l.avgInternalRating || 0);
+          return `<div data-id="${l.id}" class="listing-card bg-white rounded-2xl overflow-hidden shadow-md card-hover cursor-pointer"><img src="${l.images?.[0] || 'https://picsum.photos/id/1/400/200'}" class="h-48 w-full object-cover"><div class="p-4"><div class="flex justify-between"><h3 class="font-bold">${escapeHtml(l.name)}</h3><span class="text-xs bg-indigo-50 px-2 py-1 rounded-full">${l.category}</span></div><p class="text-gray-500 text-sm"><i class="fas fa-map-marker-alt"></i> ${escapeHtml(l.city || 'City unknown')}</p><div class="flex items-center mt-2 gap-1">${stars} <span class="text-sm">(${l.avgInternalRating?.toFixed(1) || '0'})</span></div><div class="text-xs text-gray-400 mt-1">⭐ Google: ${l.googleRating || 'N/A'} · ${l.reviewCount || 0} reviews</div></div></div>`;
+        }).join('') + `</div>`;
+      }
+      
+      const mainHtml = `<div>${featuredHtml}<div class="bg-white p-4 rounded-2xl shadow-sm mb-6">${filterHtml}</div>${cardsHtml}</div>`;
+      document.getElementById("mainContent").innerHTML = mainHtml;
+      document.getElementById("searchInput")?.addEventListener("input", (e) => { searchTerm = e.target.value; renderMain(); });
+      document.querySelectorAll(".cat-filter").forEach(btn => btn.addEventListener("click", (e) => { activeCategory = btn.getAttribute("data-cat"); renderMain(); }));
+      document.querySelectorAll(".listing-card, .featured-card").forEach(card => card.addEventListener("click", (e) => { const id = card.getAttribute("data-id"); if(id) { selectedListingId = id; currentView = "detail"; renderMain(); } }));
+    }
+    
+    // Detail view with Google rating & internal rating, reviews, offers
+    async function renderDetailView() {
+      if (!selectedListingId) { currentView = "listings"; renderMain(); return; }
+      const listingRef = doc(db, "listings", selectedListingId);
+      const listingSnap = await getDoc(listingRef);
+      if (!listingSnap.exists()) { showToast("Listing not found", true); currentView = "listings"; renderMain(); return; }
+      const listing = { id: listingSnap.id, ...listingSnap.data() };
+      // track view
+      await trackListingView(selectedListingId);
+      // fetch google details
+      let googleData = null;
+      if (listing.placeId) googleData = await fetchGooglePlaceDetails(listing.placeId);
+      const googleRating = googleData?.rating || listing.googleRating || "Not available";
+      // fetch user reviews for this listing
+      const reviewsQuery = query(collection(db, "reviews"), where("listingId", "==", selectedListingId), orderBy("createdAt", "desc"));
+      const reviewsSnap = await getDocs(reviewsQuery);
+      const reviews = [];
+      reviewsSnap.forEach(doc => reviews.push({ id: doc.id, ...doc.data() }));
+      const userHasReviewed = currentUser ? reviews.some(r => r.userId === currentUser.uid) : false;
+      
+      const starsDisplay = renderStars(listing.avgInternalRating || 0);
+      const galleryHtml = listing.images?.length ? `<div class="flex gap-3 overflow-x-auto pb-3">${listing.images.map(img => `<img src="${img}" class="w-32 h-32 rounded-xl object-cover">`).join('')}</div>` : `<div class="text-gray-400">No images</div>`;
+      
+      const offersHtml = listing.specialOffers ? `<div class="mt-2 bg-green-50 p-3 rounded-xl"><i class="fas fa-tag text-green-600"></i> ${listing.specialOffers}</div>` : (googleData?.editorial_summary?.overview ? `<div class="mt-2 text-sm text-gray-600">✨ ${googleData.editorial_summary.overview}</div>` : '');
+      
+      const detailHtml = `
+        <div class="bg-white rounded-2xl shadow-md overflow-hidden">
+          <button id="backBtn" class="m-4 inline-flex items-center gap-2 text-indigo-600 bg-indigo-50 px-4 py-2 rounded-full"><i class="fas fa-arrow-left"></i> Back</button>
+          <div class="p-5 pt-0">
+            <h2 class="text-2xl font-bold">${escapeHtml(listing.name)}</h2>
+            <div class="flex gap-4 mt-1 text-gray-600"><i class="fas fa-map-pin"></i> ${escapeHtml(listing.city)} | ${listing.category}</div>
+            <div class="grid md:grid-cols-2 gap-6 mt-4">
+              <div>${galleryHtml}<div class="mt-4"><p class="font-semibold">📝 Description</p><p>${escapeHtml(listing.description || 'No description')}</p><p class="mt-2"><i class="fas fa-phone"></i> ${listing.phone || 'N/A'}</p><p><i class="fab fa-whatsapp"></i> <a href="https://wa.me/${listing.whatsapp?.replace(/\D/g,'')}" target="_blank">WhatsApp</a></p><p><i class="fas fa-dollar-sign"></i> Price Level: ${googleData?.price_level ? '$'.repeat(googleData.price_level) : listing.priceRange || 'Contact'}</p>${offersHtml}</div></div>
+              <div><div class="bg-gray-50 p-4 rounded-xl"><div class="flex justify-between"><div><span class="font-bold">⭐ Internal Rating:</span> ${listing.avgInternalRating?.toFixed(1) || 0} (${listing.reviewCount || 0} reviews)</div><div>${starsDisplay}</div></div><div class="mt-2"><span class="font-bold">📊 Google Rating:</span> ${googleRating} / 5</div><div class="mt-3"><span class="font-bold">🕒 Opening Hours:</span> ${googleData?.opening_hours?.weekday_text?.slice(0,2).join(', ') || 'Not specified'}</div><div class="mt-3"><span class="font-bold">📈 Availability / Offers:</span> ${listing.availabilityText || 'Please contact for current availability'}</div></div>
+                <div class="mt-5"><h3 class="font-bold text-lg">✍️ User Reviews</h3>${reviews.length ? reviews.map(r => `<div class="border-b py-2"><div class="flex items-center gap-2">${renderStars(r.rating)} <span class="font-medium">${escapeHtml(r.userName)}</span><span class="text-xs text-gray-400">${new Date(r.createdAt?.toDate()).toLocaleDateString()}</span></div><p class="text-sm mt-1">${escapeHtml(r.comment)}</p></div>`).join('') : '<p class="text-gray-400 text-sm">No reviews yet. Be the first to rate!</p>}</div>
+                ${currentUser && !userHasViewedReview(userHasReviewed, listing) ? `
+                <div class="mt-5 border-t pt-4"><h4 class="font-semibold">Submit your review</h4><div id="starSelect" class="flex gap-1 text-2xl my-2">${[1,2,3,4,5].map(s => `<i data-score="${s}" class="far fa-star cursor-pointer text-yellow-500"></i>`).join('')}</div><textarea id="reviewComment" class="w-full border p-2 rounded-lg" rows="2" placeholder="Your experience..."></textarea><button id="submitReviewBtn" class="mt-2 bg-indigo-600 text-white px-4 py-2 rounded-full">Submit Review</button></div>
+                ` : (userHasReviewed ? `<div class="mt-4 text-green-600 text-sm"><i class="fas fa-check-circle"></i> You already reviewed this place.</div>` : `<div class="mt-4 text-gray-500 text-sm"><i class="fas fa-lock"></i> Sign in to write a review.</div>`)}
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+      document.getElementById("mainContent").innerHTML = detailHtml;
+      document.getElementById("backBtn")?.addEventListener("click", () => { currentView = "listings"; renderMain(); });
+      if (currentUser && !userHasReviewed) {
+        let selectedRating = 0;
+        document.querySelectorAll("#starSelect i").forEach(star => {
+          star.addEventListener("click", (e) => { selectedRating = parseInt(star.getAttribute("data-score")); document.querySelectorAll("#starSelect i").forEach(s => s.className = "far fa-star cursor-pointer text-yellow-500"); for(let i=0; i<selectedRating; i++) document.querySelectorAll("#starSelect i")[i]?.classList.replace("far","fas"); });
+        });
+        document.getElementById("submitReviewBtn")?.addEventListener("click", async () => {
+          if(selectedRating === 0) { showToast("Select rating first", true); return; }
+          const comment = document.getElementById("reviewComment").value.trim();
+          await addDoc(collection(db, "reviews"), { listingId: selectedListingId, userId: currentUser.uid, userName: currentUser.email.split('@')[0], rating: selectedRating, comment: comment || "Great place!", createdAt: Timestamp.now() });
+          // update listing internal avg
+          const newReviewsSnap = await getDocs(query(collection(db, "reviews"), where("listingId", "==", selectedListingId)));
+          let total = 0, count = 0;
+          newReviewsSnap.forEach(d => { total += d.data().rating; count++; });
+          const newAvg = total / count;
+          await updateDoc(listingRef, { avgInternalRating: newAvg, reviewCount: count });
+          showToast("Review submitted! Thank you.");
+          renderDetailView();
+        });
+      }
+    }
+    
+    // Helper
+    function userHasViewedReview(hasReviewed, listing) { return hasReviewed; }
+    
+    // Admin Panel: manage listings, featured, add new via Google Place ID
+    async function renderAdminPanel() {
+      if (currentUserRole !== "admin") { currentView = "listings"; renderMain(); return; }
+      const listingsSnap = await getDocs(collection(db, "listings"));
+      const listings = [];
+      listingsSnap.forEach(d => listings.push({ id: d.id, ...d.data() }));
+      const adminHtml = `
+        <div class="bg-white rounded-2xl p-5 shadow mb-6"><h2 class="text-2xl font-bold"><i class="fas fa-shield-alt"></i> Admin Dashboard</h2><button id="exitAdmin" class="mt-2 bg-gray-500 text-white px-3 py-1 rounded-full text-sm">Exit Admin</button></div>
+        <div class="bg-white rounded-2xl p-5 shadow mb-8"><h3 class="text-xl font-bold mb-3">➕ Add New Listing (Google Place ID)</h3><input id="adminPlaceId" placeholder="Google Place ID" class="border p-2 rounded w-full mb-2"><input id="adminName" placeholder="Name" class="border p-2 rounded w-full mb-2"><input id="adminCity" placeholder="City" class="border p-2 rounded w-full mb-2"><select id="adminCategory" class="border p-2 rounded w-full mb-2"><option>Hotel</option><option>Restaurant</option><option>Hostel</option></select><textarea id="adminDesc" placeholder="Description" rows="2" class="border p-2 rounded w-full mb-2"></textarea><input id="adminImages" placeholder="Image URLs (comma)" class="border p-2 rounded w-full mb-2"><input id="adminOffers" placeholder="Special Offers / Discounts" class="border p-2 rounded w-full mb-2"><input id="adminPhone" placeholder="Phone" class="border p-2 rounded w-full mb-2"><button id="createListingBtn" class="bg-indigo-600 text-white px-5 py-2 rounded-full">Create Listing</button></div>
+        <h3 class="font-bold text-xl mb-3">📋 Manage Listings (Toggle Featured)</h3><div class="grid gap-3">${listings.map(l => `<div class="bg-white p-3 rounded-xl shadow flex justify-between items-center"><div><p class="font-bold">${escapeHtml(l.name)} (${l.category})</p><p class="text-sm">⭐ Internal: ${l.avgInternalRating?.toFixed(1)||0} · Reviews: ${l.reviewCount||0} · ${l.featured ? '🔥 Featured' : ''}</p></div><div><button data-id="${l.id}" class="toggleFeatured bg-yellow-500 text-white px-3 py-1 rounded mr-2 text-sm">${l.featured ? 'Unfeature' : 'Feature'}</button><button data-id="${l.id}" class="deleteListing bg-red-500 text-white px-3 py-1 rounded text-sm">Delete</button></div></div>`).join('')}</div>
+      `;
+      document.getElementById("mainContent").innerHTML = adminHtml;
+      document.getElementById("exitAdmin")?.addEventListener("click", () => { adminMode = false; currentView = "listings"; renderMain(); });
+      document.getElementById("createListingBtn")?.addEventListener("click", async () => {
+        const placeId = document.getElementById("adminPlaceId").value.trim();
+        const name = document.getElementById("adminName").value.trim();
+        if (!name || !placeId) { showToast("Place ID & Name required", true); return; }
+        const imagesArr = document.getElementById("adminImages").value.split(",").map(s=>s.trim()).filter(s=>s);
+        const newListing = {
+          name, city: document.getElementById("adminCity").value.trim() || "Unknown", category: document.getElementById("adminCategory").value,
+          description: document.getElementById("adminDesc").value, images: imagesArr.length ? imagesArr : ["https://picsum.photos/id/20/400/300"],
+          specialOffers: document.getElementById("adminOffers").value, phone: document.getElementById("adminPhone").value,
+          placeId: placeId, featured: false, avgInternalRating: 0, reviewCount: 0, totalViews: 0, dailyViews: {}, createdAt: Timestamp.now()
+        };
+        await addDoc(collection(db, "listings"), newListing);
+        showToast("Listing added");
+        renderAdminPanel();
+      });
+      document.querySelectorAll(".toggleFeatured").forEach(btn => btn.addEventListener("click", async (e) => {
+        const id = btn.getAttribute("data-id");
+        const listingRef = doc(db, "listings", id);
+        const snap = await getDoc(listingRef);
+        if(snap.exists()) await updateDoc(listingRef, { featured: !snap.data().featured });
+        renderAdminPanel();
+      }));
+      document.querySelectorAll(".deleteListing").forEach(btn => btn.addEventListener("click", async (e) => {
+        if(confirm("Delete permanently?")) { await deleteDoc(doc(db, "listings", btn.getAttribute("data-id"))); renderAdminPanel(); }
+      }));
+    }
+    
+    // Auth Modal (Sign In / Sign Up)
+    function renderAuthModal() {
+      const modalHtml = `<div id="authOverlay" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50"><div class="bg-white rounded-2xl p-6 w-96 max-w-md"><h2 class="text-2xl font-bold mb-4">Welcome</h2><input id="authName" placeholder="Full Name" class="w-full border p-2 rounded mb-2"><input id="authEmail" placeholder="Email" class="w-full border p-2 rounded mb-2" type="email"><input id="authPassword" placeholder="Password" class="w-full border p-2 rounded mb-4" type="password"><div class="flex gap-3"><button id="loginBtn" class="bg-indigo-600 text-white px-4 py-2 rounded-full">Sign In</button><button id="signupBtn" class="bg-gray-600 text-white px-4 py-2 rounded-full">Sign Up</button><button id="closeAuth" class="ml-auto text-gray-500">Cancel</button></div></div></div>`;
+      document.body.insertAdjacentHTML("beforeend", modalHtml);
+      const close = () => document.getElementById("authOverlay")?.remove();
+      document.getElementById("closeAuth")?.addEventListener("click", close);
+      document.getElementById("loginBtn")?.addEventListener("click", async () => {
+        const email = document.getElementById("authEmail").value, pwd = document.getElementById("authPassword").value;
+        try { await signInWithEmailAndPassword(auth, email, pwd); close(); showToast("Logged in!"); } catch(e) { showToast(e.message, true); }
+      });
+      document.getElementById("signupBtn")?.addEventListener("click", async () => {
+        const email = document.getElementById("authEmail").value, pwd = document.getElementById("authPassword").value, name = document.getElementById("authName").value;
+        try {
+          const cred = await createUserWithEmailAndPassword(auth, email, pwd);
+          await setDoc(doc(db, "users", cred.user.uid), { email, name, role: email === "admin@example.com" ? "admin" : "user", createdAt: Timestamp.now() });
+          close(); showToast("Account created");
+        } catch(e) { showToast(e.message, true); }
+      });
+    }
+    
+    // Main render router
+    async function renderMain() {
+      if (!currentUser) {
+        // show public listings but no review submit, but still allow view
+        await trackGlobalVisitor();
+        await renderListingsView();
+        updateHeader();
+        return;
+      }
+      currentUserRole = await fetchUserRole(currentUser);
+      updateHeader();
+      await trackGlobalVisitor();
+      if (adminMode && currentUserRole === "admin") await renderAdminPanel();
+      else if (currentView === "detail" && selectedListingId) await renderDetailView();
+      else await renderListingsView();
+    }
+    
+    function renderStars(rating) {
+      const full = Math.floor(rating);
+      let str = "";
+      for(let i=0;i<full;i++) str += `<i class="fas fa-star rating-star"></i>`;
+      if(rating % 1 >= 0.5) str += `<i class="fas fa-star-half-alt rating-star"></i>`;
+      for(let i=str.length/2;i<5;i++) str += `<i class="far fa-star rating-star"></i>`;
+      return str;
+    }
+    function escapeHtml(str) { if(!str) return ''; return str.replace(/[&<>]/g, function(m){if(m==='&') return '&amp;'; if(m==='<') return '&lt;'; if(m==='>') return '&gt;'; return m;}); }
+    
+    window.initMapsReady = () => console.log("Maps ready");
+    onAuthStateChanged(auth, async (user) => { currentUser = user; await renderMain(); });
+    renderMain();
+  </script>
+</body>
+</html>
